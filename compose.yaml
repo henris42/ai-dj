@@ -1,0 +1,12 @@
+services:
+  qdrant:
+    image: docker.io/qdrant/qdrant:v1.17.1
+    container_name: ai-dj-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant:/qdrant/storage:z
+    environment:
+      QDRANT__LOG_LEVEL: INFO
