@@ -18,6 +18,7 @@ dependencies = [
     "umap-learn>=0.5",
     "PySide6>=6.7",
     "pyqtgraph>=0.13",
+    "PyOpenGL",
     "python-mpv>=1.0",
 ]
 

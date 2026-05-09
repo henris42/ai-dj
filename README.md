@@ -1,11 +1,18 @@
 # AI DJ
 
+<img src="assets/icon-256.png" align="right" width="120" alt="AI DJ icon">
+
 Maps your music library into a vector DB ([Qdrant](https://qdrant.tech/)),
 tags it with supervised genre classification ([Discogs-Effnet](https://essentia.upf.edu/models/)),
 and plans listening paths through the resulting embedding space — visualised
 in 3D, including a fractal planet you fly between songs.
 
-![icon](assets/icon-256.png)
+![Planet visualizer — fractal world generated from the embedding space, plane flies between waypoints in time with the music](assets/screenshots/03-planet.png)
+
+| Free orbit | Follow path | Top-down | First-person |
+| :---: | :---: | :---: | :---: |
+| [![](assets/screenshots/02-free.png)](assets/screenshots/02-free.png) | [![](assets/screenshots/01-follow.png)](assets/screenshots/01-follow.png) | [![](assets/screenshots/04-top-down.png)](assets/screenshots/04-top-down.png) | [![](assets/screenshots/00-first-person.png)](assets/screenshots/00-first-person.png) |
+| UMAP scatter; each dot is a track, coloured by genre | path lines through the cloud, camera follows current track | bird's-eye over the path | flies along the path in time with playback |
 
 ---
 
