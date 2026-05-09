@@ -11,16 +11,23 @@ in 3D, including a fractal planet you fly between songs.
 
 ## Quick start
 
-You need: **Linux or WSL2**, **[uv](https://github.com/astral-sh/uv)**, and
-**Docker / Podman** (for Qdrant).
+You need:
+
+- **Python 3.10 or 3.11**
+- **[uv](https://github.com/astral-sh/uv)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **Docker or Podman** (for the Qdrant container)
+- **A music library** — anything `librosa` decodes (mp3 / m4a / flac / wav / aac / ogg / opus). iTunes DRM (`.m4p`) is skipped.
+
+Works on Linux, macOS, and Windows. CPU is fine — a CUDA GPU just makes the
+embed step faster (auto-detected, nothing to configure).
 
 ```bash
 git clone https://github.com/henris42/ai-dj && cd ai-dj
-uv sync                                     # installs Python deps
-./scripts/qdrant_up.sh                      # starts Qdrant on :6333
+uv sync
+./scripts/qdrant_up.sh
 ```
 
-Download the genre tagger (~20 MB) once:
+Download the genre tagger model files (~20 MB, one-time):
 
 ```bash
 mkdir -p data/models && cd data/models
@@ -30,7 +37,8 @@ curl -LO https://essentia.upf.edu/models/classification-heads/genre_discogs400/g
 cd ../..
 ```
 
-Index your library (this is the long part — a few hours for 10 k tracks):
+Index your library (the long part — a couple of hours for 10 k tracks on
+CPU, faster on GPU):
 
 ```bash
 uv run python scripts/build_index.py --library /path/to/your/music
@@ -43,51 +51,31 @@ Run it:
 uv run python -m ai_dj.gui.app
 ```
 
-That's it. The window has a library browser on the left, a queue, an "Up
-Next" panel, genre-steer buttons across the top, and a 3D visualizer on the
-right (try the **Planet** mode).
+That's it. Window has a library browser, queue, "Up Next" panel,
+genre-steer buttons, and a 3D visualizer (try **Planet**).
 
 ---
 
-## Notes
+## Re-runs
 
-- **GPU**: `build_index.py` uses CUDA out of the box. For AMD on WSL, see
-  [ROCm setup notes](#rocm-on-wsl) below.
-- **Re-runnable**: both `build_index.py` and `tag_library_discogs.py` skip
-  tracks they've already processed. Re-run anytime you add music.
-- **Supported formats**: anything `librosa` decodes — mp3, m4a, flac, wav,
-  aac, ogg, opus. iTunes DRM (`.m4p`) is skipped.
-- **Disk**: budget ~25 GB for embeddings + Qdrant data on a 10 k library.
+`build_index.py` and `tag_library_discogs.py` both skip tracks they've
+already done — re-run anytime you add music, no flags needed.
 
 ---
 
-## Run on Windows (with the GUI native)
+## Optional: AMD ROCm GPU
 
-WSL's audio output (WSLg) glitches under crossfades, so the GUI can run
-natively on Windows while Qdrant + indexing stay in WSL.
+Default `uv sync` installs CPU/CUDA torch (whatever pip's wheel resolver
+picks for your platform). If you have an AMD GPU and want it used by the
+embed step, install ROCm-built torch on top:
 
-Install Python deps for the Windows side once:
-
-```powershell
-cd C:\Users\<you>\ai-dj
-uv sync --no-dev
+```bash
+uv pip install --index-url https://download.pytorch.org/whl/rocm6.4 \
+  torch==2.9.1+rocm6.4 torchaudio==2.9.1+rocm6.4 pytorch-triton-rocm
 ```
 
-Then either:
-
-- run `launch.ps1` directly, or
-- run `install-shortcut.ps1` once → AI DJ appears in the **Start menu**
-  (Win → "AI DJ"). Right-click the running window's taskbar icon → Pin to
-  taskbar to keep it there.
-
-`launch.ps1` boots Qdrant in WSL, waits for it, and surfaces failures as a
-Windows MessageBox (full log: `data/launch.log`).
-
----
-
-## ROCm on WSL
-
-For an RX 7000-series card on WSL2:
+For ROCm on **WSL2** specifically (RX 7000-series), there are a couple of
+extra steps:
 
 - ROCm 6.4 user-space (no `rocm-dkms` — WSL uses a kernel shim). Follow the
   [official guide](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/3rd-party/wsl.html)
@@ -97,6 +85,23 @@ For an RX 7000-series card on WSL2:
   without it SDPA hangs on gfx1101 with batched input.
 
 Sanity check: `uv run python scripts/gpu_smoke.py`.
+
+---
+
+## Optional: Native Windows GUI (with WSL backend)
+
+WSL's audio (WSLg) glitches under crossfades, so on Windows you can keep
+Qdrant + indexing in WSL but run the GUI natively:
+
+```powershell
+cd C:\path\to\ai-dj
+uv sync --no-dev
+.\install-shortcut.ps1     # adds "AI DJ" to the Start menu
+```
+
+`launch.ps1` boots Qdrant in WSL, waits for it, and surfaces failures as a
+Windows MessageBox. Full log in `data/launch.log`. After launching once,
+right-click the running window's taskbar icon → Pin to taskbar to keep it.
 
 ---
 
