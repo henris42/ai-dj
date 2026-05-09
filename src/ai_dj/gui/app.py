@@ -1043,7 +1043,21 @@ class Window(QMainWindow):
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    # Tell Windows this process is its own app, not "python.exe". Without
+    # this the taskbar groups under Python and shows the Python icon — so
+    # pinning the running window doesn't carry our identity. Must happen
+    # before the QApplication is created.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("aidj.henris42")
+        except Exception:  # noqa: BLE001
+            pass
+
     app = QApplication(sys.argv)
+    app.setApplicationName("AI DJ")
+    app.setOrganizationName("henris42")
 
     # Window / taskbar icon. The SVG scales to all needed sizes; falls back to
     # the rasterized PNG if PySide's SVG plugin isn't available.
