@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import subprocess
 import sys
 import time
 from collections import deque
@@ -35,6 +37,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QCompleter,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -42,6 +45,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -56,6 +60,7 @@ from ai_dj import projection as projmod
 from ai_dj import styles as stylesmod
 from ai_dj import visualizers as vizmod
 from ai_dj.index import COLLECTION, TrackIndex
+from ai_dj.paths import resolve_for_player
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +85,99 @@ def _fmt_time(seconds: float | None) -> str:
         h, m = divmod(m, 60)
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def _open_containing_folder(path: str) -> None:
+    """Reveal the file in the OS's native file manager."""
+    if not path:
+        return
+    p = resolve_for_player(path)  # /mnt/e/... → E:\... on Windows
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", f"/select,{p}"])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", p])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(p) or "."])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not reveal %s: %s", p, e)
+
+
+class TrackInfoDialog(QDialog):
+    """Read-only dialog showing every payload field for one track, plus a
+    button to reveal the audio file in the OS file manager."""
+
+    def __init__(self, payload: dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Track info")
+        self.resize(560, 420)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 12, 14, 12)
+        v.setSpacing(6)
+
+        title = payload.get("title") or Path(payload.get("path") or "").stem or "(unknown)"
+        artist = payload.get("artist") or "?"
+        album = payload.get("album") or "—"
+        dur = payload.get("duration_s")
+
+        head = QLabel(f"<h3 style='margin: 0'>{artist} — {title}</h3>")
+        head.setTextFormat(Qt.RichText)
+        head.setWordWrap(True)
+        v.addWidget(head)
+
+        sub = QLabel(f"{album}   ·   {_fmt_time(dur)}")
+        sub.setStyleSheet("color: #aaa;")
+        v.addWidget(sub)
+        v.addSpacing(8)
+
+        rows: list[tuple[str, str]] = []
+        if payload.get("genre"):
+            rows.append(("iTunes genre", str(payload["genre"])))
+        if payload.get("ai_genre"):
+            score = payload.get("ai_genre_score")
+            score_s = f"  ({float(score):.2f})" if isinstance(score, (int, float)) else ""
+            rows.append(("AI genre", f"{payload['ai_genre']}{score_s}"))
+        if payload.get("ai_genre_top3"):
+            top = "  ·  ".join(f"{g} {float(s):.2f}" for g, s in payload["ai_genre_top3"])
+            rows.append(("AI top-3", top))
+        if payload.get("ai_tagger"):
+            rows.append(("Tagger", str(payload["ai_tagger"])))
+        rows.append(("Track ID", str(payload.get("track_id") or "—")))
+
+        for label, value in rows:
+            row = QHBoxLayout()
+            l = QLabel(f"<b>{label}:</b>")
+            l.setTextFormat(Qt.RichText)
+            l.setMinimumWidth(110)
+            row.addWidget(l)
+            val = QLabel(value)
+            val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            val.setWordWrap(True)
+            row.addWidget(val, stretch=1)
+            v.addLayout(row)
+
+        v.addSpacing(10)
+        path = payload.get("path") or ""
+        path_label = QLabel(path)
+        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        path_label.setWordWrap(True)
+        path_label.setStyleSheet("font-family: monospace; color: #888;")
+        v.addWidget(path_label)
+        v.addStretch(1)
+
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy path")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(path))
+        btn_row.addWidget(copy_btn)
+        open_btn = QPushButton("Show in file manager")
+        open_btn.clicked.connect(lambda: _open_containing_folder(path))
+        btn_row.addWidget(open_btn)
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        v.addLayout(btn_row)
 
 
 class TrackDragList(QListWidget):
@@ -283,6 +381,7 @@ class Window(QMainWindow):
         self._populate_search_model()
         self._wire_timers()
         self._wire_shortcuts()
+        self._wire_context_menus()
         # Activate the first registered visualizer as the default
         if self._viz_classes:
             first = self._viz_classes[0]
@@ -516,6 +615,51 @@ class Window(QMainWindow):
         self.anim_timer.timeout.connect(self._anim_tick)
         self.anim_timer.start()
         self._anim_t = 0.0
+
+    def _wire_context_menus(self) -> None:
+        """Right-click on any track-bearing widget → "Track info..." menu."""
+        for lst in (self.lib_tracks, self.queue_list):
+            lst.setContextMenuPolicy(Qt.CustomContextMenu)
+            lst.customContextMenuRequested.connect(
+                lambda pos, w=lst: self._show_list_context_menu(w, pos)
+            )
+        self.next_panel.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.next_panel.customContextMenuRequested.connect(self._show_next_context_menu)
+
+    def _show_list_context_menu(self, lst: QListWidget, pos) -> None:
+        item = lst.itemAt(pos)
+        if item is None:
+            return
+        track_id = item.data(Qt.UserRole)
+        if not track_id:
+            return
+        self._popup_track_menu(track_id, lst.mapToGlobal(pos))
+
+    def _show_next_context_menu(self, pos) -> None:
+        tid = self.next_panel._track_id
+        if not tid:
+            return
+        self._popup_track_menu(tid, self.next_panel.mapToGlobal(pos))
+
+    def _popup_track_menu(self, track_id: str, global_pos) -> None:
+        menu = QMenu(self)
+        info_action = menu.addAction("Track info…")
+        reveal_action = menu.addAction("Show in file manager")
+        chosen = menu.exec(global_pos)
+        if chosen is info_action:
+            self._show_track_info(track_id)
+        elif chosen is reveal_action:
+            rec = self.idx.client.retrieve(COLLECTION, [track_id], with_payload=True, with_vectors=False)
+            if rec:
+                _open_containing_folder((rec[0].payload or {}).get("path") or "")
+
+    def _show_track_info(self, track_id: str) -> None:
+        rec = self.idx.client.retrieve(COLLECTION, [track_id], with_payload=True, with_vectors=False)
+        if not rec:
+            return
+        payload = dict(rec[0].payload or {})
+        payload["track_id"] = track_id
+        TrackInfoDialog(payload, self).exec()
 
     def _populate_search_model(self) -> None:
         """Load track summaries once and use them for search autocomplete,
