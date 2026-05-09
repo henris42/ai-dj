@@ -111,6 +111,10 @@ class TrackInfoDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Track info")
         self.resize(560, 420)
+        # Non-modal: the user can keep clicking around the main window while
+        # the info dialog stays open. Auto-cleanup on close.
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setModal(False)
         v = QVBoxLayout(self)
         v.setContentsMargins(14, 12, 14, 12)
         v.setSpacing(6)
@@ -659,7 +663,9 @@ class Window(QMainWindow):
             return
         payload = dict(rec[0].payload or {})
         payload["track_id"] = track_id
-        TrackInfoDialog(payload, self).exec()
+        # show() is non-blocking; the main window stays responsive. The
+        # WA_DeleteOnClose flag set in TrackInfoDialog cleans up automatically.
+        TrackInfoDialog(payload, self).show()
 
     def _populate_search_model(self) -> None:
         """Load track summaries once and use them for search autocomplete,
