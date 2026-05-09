@@ -16,57 +16,59 @@ You need:
 - **Python 3.10 or 3.11**
 - **[uv](https://github.com/astral-sh/uv)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - **Docker or Podman** (for the Qdrant container)
-- **A music library** — anything `librosa` decodes (mp3 / m4a / flac / wav / aac / ogg / opus). iTunes DRM (`.m4p`) is skipped.
 
-Works on Linux, macOS, and Windows. `setup.py` checks what GPU you have
-(NVIDIA, AMD ROCm, or nothing) and installs the right torch — you don't
-need to know.
+One command sets everything up and launches the app:
 
 ```bash
 git clone https://github.com/henris42/ai-dj && cd ai-dj
-python3 setup.py
-./scripts/qdrant_up.sh
+python3 run.py --library /path/to/your/music
 ```
 
-Download the genre tagger model files (~20 MB, one-time):
+`run.py` does:
+
+1. Detects your hardware and installs the right torch (CPU / NVIDIA CUDA /
+   AMD ROCm / Apple MPS — automatically).
+2. Downloads the genre-tagger model files (~20 MB, once).
+3. Brings up Qdrant in a container and waits for it.
+4. Scans + embeds + genre-tags your library (this is the long part — a
+   couple of hours for 10 k tracks on CPU, faster on GPU).
+5. Launches the GUI.
+
+After the first run, just:
 
 ```bash
-mkdir -p data/models && cd data/models
-curl -LO https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb
-curl -LO https://essentia.upf.edu/models/classification-heads/genre_discogs400/genre_discogs400-discogs-effnet-1.pb
-curl -LO https://essentia.upf.edu/models/classification-heads/genre_discogs400/genre_discogs400-discogs-effnet-1.json
-cd ../..
+python3 run.py
 ```
 
-Index your library (the long part — a couple of hours for 10 k tracks on
-CPU, faster on GPU):
+— same script, idempotent, skips the steps that are already done. Re-run
+with `--library PATH` whenever you add music; only new tracks are processed.
 
-```bash
-uv run python scripts/build_index.py --library /path/to/your/music
-uv run python scripts/tag_library_discogs.py
-```
-
-Run it:
-
-```bash
-uv run python -m ai_dj.gui.app
-```
-
-That's it. Window has a library browser, queue, "Up Next" panel,
-genre-steer buttons, and a 3D visualizer (try **Planet**).
+Supported formats: anything `librosa` decodes — mp3, m4a, flac, wav, aac,
+ogg, opus. iTunes DRM (`.m4p`) is skipped.
 
 ---
 
-## Re-runs
+## What you get
 
-`build_index.py` and `tag_library_discogs.py` both skip tracks they've
-already done — re-run anytime you add music, no flags needed.
+A window with:
+
+- **Library** browser (Artists / Albums / Tracks, iTunes-style) — drag
+  tracks into the queue.
+- **Now Playing + Up Next + Queue** — auto-extending; drop tracks anywhere.
+- **Steering buttons** across the top (Rock, Pop, Electronic, …) to
+  constrain the path.
+- **Pinned artists** — type-ahead to restrict to specific artists.
+- **3D visualizer** — Free orbit, Follow path, First-person, Top-down, or
+  **Planet** (fractal world generated from the embeddings, plane flies
+  between waypoints in time with the music).
+
+`R` resets the camera, `Space` plays/pauses, `Backspace` is "previous track".
 
 ---
 
 ## ROCm on WSL2
 
-`setup.py` will install ROCm torch automatically when it sees `/dev/kfd` +
+`run.py` will install ROCm torch automatically when it sees `/dev/kfd` +
 `rocminfo` on the host. For an RX 7000-series card on WSL2 specifically,
 ROCm itself needs a couple of extra steps before that detection works:
 
@@ -81,19 +83,19 @@ Sanity check: `uv run python scripts/gpu_smoke.py`.
 
 ---
 
-## Optional: Native Windows GUI (with WSL backend)
+## Native Windows GUI (optional)
 
 WSL's audio (WSLg) glitches under crossfades, so on Windows you can keep
-Qdrant + indexing in WSL but run the GUI natively:
+Qdrant + indexing in WSL and run the GUI natively:
 
 ```powershell
 cd C:\path\to\ai-dj
-python setup.py
-.\install-shortcut.ps1     # adds "AI DJ" to the Start menu
+python run.py --no-launch     # set up the Windows venv only
+.\install-shortcut.ps1        # adds "AI DJ" to the Start menu
 ```
 
 `launch.ps1` boots Qdrant in WSL, waits for it, and surfaces failures as a
-Windows MessageBox. Full log in `data/launch.log`. After launching once,
+Windows MessageBox (full log: `data\launch.log`). After launching once,
 right-click the running window's taskbar icon → Pin to taskbar to keep it.
 
 ---
