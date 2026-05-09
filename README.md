@@ -18,12 +18,13 @@ You need:
 - **Docker or Podman** (for the Qdrant container)
 - **A music library** — anything `librosa` decodes (mp3 / m4a / flac / wav / aac / ogg / opus). iTunes DRM (`.m4p`) is skipped.
 
-Works on Linux, macOS, and Windows. CPU is fine — a CUDA GPU just makes the
-embed step faster (auto-detected, nothing to configure).
+Works on Linux, macOS, and Windows. `setup.py` checks what GPU you have
+(NVIDIA, AMD ROCm, or nothing) and installs the right torch — you don't
+need to know.
 
 ```bash
 git clone https://github.com/henris42/ai-dj && cd ai-dj
-uv sync
+python3 setup.py
 ./scripts/qdrant_up.sh
 ```
 
@@ -63,19 +64,11 @@ already done — re-run anytime you add music, no flags needed.
 
 ---
 
-## Optional: AMD ROCm GPU
+## ROCm on WSL2
 
-Default `uv sync` installs CPU/CUDA torch (whatever pip's wheel resolver
-picks for your platform). If you have an AMD GPU and want it used by the
-embed step, install ROCm-built torch on top:
-
-```bash
-uv pip install --index-url https://download.pytorch.org/whl/rocm6.4 \
-  torch==2.9.1+rocm6.4 torchaudio==2.9.1+rocm6.4 pytorch-triton-rocm
-```
-
-For ROCm on **WSL2** specifically (RX 7000-series), there are a couple of
-extra steps:
+`setup.py` will install ROCm torch automatically when it sees `/dev/kfd` +
+`rocminfo` on the host. For an RX 7000-series card on WSL2 specifically,
+ROCm itself needs a couple of extra steps before that detection works:
 
 - ROCm 6.4 user-space (no `rocm-dkms` — WSL uses a kernel shim). Follow the
   [official guide](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/3rd-party/wsl.html)
@@ -95,7 +88,7 @@ Qdrant + indexing in WSL but run the GUI natively:
 
 ```powershell
 cd C:\path\to\ai-dj
-uv sync --no-dev
+python setup.py
 .\install-shortcut.ps1     # adds "AI DJ" to the Start menu
 ```
 
