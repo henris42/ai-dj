@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AI DJ
+Comment=Vector-DB music player with embedding-space path planning
+# Edit these two paths to match where you cloned the repo:
+Exec=sh -c 'cd /home/hs/ai-dj && uv run python -m ai_dj.gui.app'
+Icon=/home/hs/ai-dj/assets/icon-256.png
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+StartupNotify=true

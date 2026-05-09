@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <radialGradient id="planet" cx="40%" cy="35%" r="75%">
+      <stop offset="0%" stop-color="#3a4d6e"/>
+      <stop offset="55%" stop-color="#1d2740"/>
+      <stop offset="100%" stop-color="#0a0f1c"/>
+    </radialGradient>
+    <radialGradient id="atmo" cx="50%" cy="50%" r="50%">
+      <stop offset="85%" stop-color="#22d3ee" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#22d3ee" stop-opacity="0.55"/>
+    </radialGradient>
+    <linearGradient id="path" x1="0" y1="0" x2="1" y2="0.3">
+      <stop offset="0%" stop-color="#fde047"/>
+      <stop offset="100%" stop-color="#ff8b3d"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- App background tile so the icon reads on light & dark surfaces -->
+  <rect x="0" y="0" width="256" height="256" rx="44" ry="44" fill="#0a0c10"/>
+
+  <!-- Planet body -->
+  <circle cx="128" cy="128" r="92" fill="url(#planet)"/>
+
+  <!-- Faint terrain rings -->
+  <g stroke="#2c3a5a" stroke-width="1.2" fill="none" opacity="0.6">
+    <ellipse cx="128" cy="128" rx="84" ry="22"/>
+    <ellipse cx="128" cy="128" rx="64" ry="80"/>
+    <ellipse cx="128" cy="128" rx="74" ry="50"/>
+  </g>
+
+  <!-- Atmosphere -->
+  <circle cx="128" cy="128" r="98" fill="url(#atmo)"/>
+
+  <!-- Listening path: great-circle arc across the planet -->
+  <path d="M 56 162 Q 100 78 200 100"
+        fill="none" stroke="url(#path)" stroke-width="7"
+        stroke-linecap="round" filter="url(#glow)"/>
+
+  <!-- Waypoint dots along the path -->
+  <g fill="#fde047">
+    <circle cx="76" cy="142" r="5"/>
+    <circle cx="120" cy="100" r="5"/>
+    <circle cx="170" cy="92" r="5"/>
+  </g>
+
+  <!-- Current-track marker (red, pulsing in the GUI) -->
+  <g filter="url(#glow)">
+    <circle cx="200" cy="100" r="11" fill="#ff4d4d"/>
+    <circle cx="200" cy="100" r="5" fill="#fff"/>
+  </g>
+</svg>

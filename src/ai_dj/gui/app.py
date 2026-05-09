@@ -29,7 +29,7 @@ import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 from PySide6.QtCore import QPointF, QSize, Qt, QStringListModel, QTimer, Signal
-from PySide6.QtGui import QColor, QCursor, QKeySequence, QShortcut
+from PySide6.QtGui import QColor, QCursor, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import QButtonGroup, QToolTip
 from PySide6.QtWidgets import (
     QApplication,
@@ -1044,6 +1044,15 @@ class Window(QMainWindow):
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     app = QApplication(sys.argv)
+
+    # Window / taskbar icon. The SVG scales to all needed sizes; falls back to
+    # the rasterized PNG if PySide's SVG plugin isn't available.
+    project_root = Path(__file__).resolve().parents[3]
+    for cand in (project_root / "assets" / "icon.svg",
+                 project_root / "assets" / "icon-256.png"):
+        if cand.exists():
+            app.setWindowIcon(QIcon(str(cand)))
+            break
 
     idx = TrackIndex()
     idx.ensure_collection()
