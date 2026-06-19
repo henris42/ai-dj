@@ -484,6 +484,18 @@ class Window(QMainWindow):
         transport.addWidget(self.library_btn)
         self._library_window = None
 
+        self.save_set_btn = QPushButton("💾  Save set")
+        self.save_set_btn.setToolTip("Capture the path you've walked (and what's "
+                                     "coming) as a replayable set")
+        self.save_set_btn.clicked.connect(self._save_current_set)
+        transport.addWidget(self.save_set_btn)
+
+        self.sets_btn = QPushButton("Sets")
+        self.sets_btn.setToolTip("Replay a journey you've walked before")
+        self.sets_btn.clicked.connect(self._open_sets)
+        transport.addWidget(self.sets_btn)
+        self._sets_window = None
+
         # Auto "new DJ": every N hours, reshuffle the Steer categories and
         # start a fresh path — unlike "New mix" this *changes* categories.
         self.autodj_chk = QCheckBox("New DJ every")
@@ -1189,6 +1201,67 @@ class Window(QMainWindow):
         self._library_window.show()
         self._library_window.raise_()
         self._library_window.activateWindow()
+
+    def _open_sets(self) -> None:
+        """Open the Sets viewer (or focus it if already open)."""
+        from ai_dj.gui.sets import SetsWindow
+        if self._sets_window is None or not self._sets_window.isVisible():
+            self._sets_window = SetsWindow(parent=self)
+            self._sets_window.set_loaded.connect(self.replay_set)
+        self._sets_window.show()
+        self._sets_window.raise_()
+        self._sets_window.activateWindow()
+
+    def _save_current_set(self) -> None:
+        """Capture history + current + upcoming as a new Set."""
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from ai_dj import sets as sets_mod
+
+        ids: list[str] = [t.track_id for t in self.history_list]
+        if self.current is not None:
+            ids.append(self.current.track_id)
+        ids.extend(t.track_id for t in self.upcoming)
+        # De-dupe while preserving order (a track could appear in history *and*
+        # upcoming after a Prev).
+        seen: set[str] = set()
+        ordered = [t for t in ids if not (t in seen or seen.add(t))]
+        if not ordered:
+            QMessageBox.information(self, "Nothing to save",
+                                    "Start playing first — there's no path yet.")
+            return
+        name, ok = QInputDialog.getText(self, "Save set", "Name this set:",
+                                        text=sets_mod._auto_name())
+        if not ok:
+            return
+        rec = sets_mod.save_set(name.strip() or sets_mod._auto_name(), ordered)
+        self.statusBar().showMessage(
+            f"Saved set '{rec.name}' ({len(rec.track_ids)} tracks)", 5000)
+
+    def replay_set(self, track_ids: list[str]) -> None:
+        """Reload a saved set — first id becomes the seed, rest go into the
+        queue in order. The user can let it play out or branch off."""
+        if not track_ids:
+            return
+        recs = self.idx.client.retrieve(
+            COLLECTION, list(track_ids), with_payload=True, with_vectors=False)
+        # Qdrant returns in arbitrary order; reorder to match the set.
+        by_id = {str(r.id): r for r in recs}
+        ordered = [by_id[t] for t in track_ids if t in by_id]
+        if not ordered:
+            logger.warning("replay_set: no matching tracks in index")
+            return
+        first = ordered[0]
+        seed = planpath.planned_from_payload(str(first.id), first.payload or {})
+        self.upcoming.clear()
+        self.history_list = []
+        self.history_cursor = -1
+        self.played_ever = set()
+        self._play_track(seed, is_seed=True)
+        for r in ordered[1:]:
+            self.upcoming.append(
+                planpath.planned_from_payload(str(r.id), r.payload or {}))
+        self._refresh_all()
+        self.statusBar().showMessage(f"Replaying set ({len(ordered)} tracks)", 4000)
 
     # ---- drag-drop seed ----
     def dragEnterEvent(self, ev):  # noqa: N802
