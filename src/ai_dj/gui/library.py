@@ -268,6 +268,71 @@ class _ArtistsView(_GroupGrid):
         return QIcon(_placeholder_pixmap(self.ICON, artist, "#4a3340"))
 
 
+class _DiscoverView(QWidget):
+    """First-cut Discover: a re-rollable random sample of the library.
+
+    The fully-realised version (bridges between clusters, outliers in
+    sparse regions of the embedding space, twins that share nearest
+    neighbours but never get played together) needs a Qdrant pass per
+    track and a background pre-compute; this view is the empty room
+    that those surfaces land in. Until then: pure serendipity, which is
+    still a step beyond the planner's curated paths."""
+
+    seed_requested = Signal(str)
+    SAMPLE = 30
+
+    def __init__(self, all_rows: list) -> None:
+        super().__init__()
+        self._all = all_rows
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+
+        row = QHBoxLayout()
+        intro = QLabel("Hidden corners of your library — re-roll for more.")
+        intro.setStyleSheet("color: #aaa;")
+        row.addWidget(intro, stretch=1)
+        reshuffle = QPushButton("Reshuffle")
+        reshuffle.clicked.connect(self._roll)
+        row.addWidget(reshuffle)
+        v.addLayout(row)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(("Artist", "Album", "Title", "Genre"))
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(24)
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.Interactive)
+        h.setSectionResizeMode(1, QHeaderView.Interactive)
+        h.setSectionResizeMode(2, QHeaderView.Stretch)
+        h.setSectionResizeMode(3, QHeaderView.Interactive)
+        self.table.itemDoubleClicked.connect(self._on_double_click)
+        v.addWidget(self.table, stretch=1)
+        self._roll()
+
+    def _roll(self) -> None:
+        sample = (random.sample(self._all, min(self.SAMPLE, len(self._all)))
+                  if self._all else [])
+        self.table.setRowCount(len(sample))
+        for r, (tid, artist, album, title, _dur, genre) in enumerate(sample):
+            for c, val in enumerate((artist, album, title, genre)):
+                it = QTableWidgetItem(val)
+                if c == 0:
+                    it.setData(Qt.UserRole, tid)
+                self.table.setItem(r, c, it)
+
+    def _on_double_click(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        first = self.table.item(row, 0)
+        if first:
+            tid = first.data(Qt.UserRole)
+            if tid:
+                self.seed_requested.emit(tid)
+
+
 class LibraryWindow(QMainWindow):
     """Non-modal Library viewer — opens from the main window's transport.
 
@@ -291,7 +356,7 @@ class LibraryWindow(QMainWindow):
         # full QTabWidget so we control the look later (iTunes-y).
         tabs = QHBoxLayout()
         self._buttons: dict[str, QPushButton] = {}
-        for name in ("Songs", "Albums", "Artists"):
+        for name in ("Songs", "Albums", "Artists", "Discover"):
             b = QPushButton(name)
             b.setCheckable(True)
             b.clicked.connect(lambda _=False, n=name: self._show(n))
@@ -317,10 +382,14 @@ class LibraryWindow(QMainWindow):
         self.artists.seed_requested.connect(self.seed_requested)
         self.stack.addWidget(self.artists)
 
+        self.discover = _DiscoverView(self.songs._all_rows)
+        self.discover.seed_requested.connect(self.seed_requested)
+        self.stack.addWidget(self.discover)
+
         self._show("Songs")
 
     def _show(self, name: str) -> None:
-        order = ("Songs", "Albums", "Artists")
+        order = ("Songs", "Albums", "Artists", "Discover")
         for n, btn in self._buttons.items():
             btn.setChecked(n == name)
         self.stack.setCurrentIndex(order.index(name))
