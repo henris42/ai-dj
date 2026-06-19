@@ -54,9 +54,16 @@ class Planner:
     # active; each interprets it sensibly. Order = combo-box order.
     MODELS: tuple[str, ...] = ("classic", "gaussian", "directed")
     MODEL_LABELS: dict[str, str] = {
-        "classic": "Classic",        # softmax over cosine — the original mixes
-        "gaussian": "Gaussian drift",  # half-normal core + long-jump tail
-        "directed": "Directed",      # Gaussian + forward heading (momentum)
+        # User-facing personas. The math is the math, but each model has a
+        # character — the New-DJ timer flashes the name on shift change.
+        "classic":  "DJ Steady",        # softmax over cosine, the proven-good mixes
+        "gaussian": "DJ Drift",         # half-normal core + long-jump tail
+        "directed": "DJ Forward",       # Gaussian + momentum through the space
+    }
+    MODEL_FLAVOR: dict[str, str] = {
+        "classic":  "Sticks close. Plays it safe. Knows what fits.",
+        "gaussian": "Mostly nearby, occasionally takes a big leap.",
+        "directed": "Always pushing in one direction through the space.",
     }
 
     def __init__(

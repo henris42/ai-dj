@@ -1118,6 +1118,18 @@ class Window(QMainWindow):
             btn.blockSignals(False)
         self.planner.set_styles(self.active_styles)
         self.start_mix()                       # new seed + rebuild within them
+        self._announce_dj(self.planner.model, prefix="Shift change",
+                          steer=", ".join(sorted(chosen)))
+
+    def _announce_dj(self, model_key: str, *, prefix: str,
+                     steer: str = "") -> None:
+        """Flash the current DJ persona in the status bar."""
+        name = planpath.Planner.MODEL_LABELS.get(model_key, model_key)
+        flavor = planpath.Planner.MODEL_FLAVOR.get(model_key, "")
+        msg = f"{prefix} — {name} — {flavor}"
+        if steer:
+            msg += f"    [{steer}]"
+        self.statusBar().showMessage(msg, 6000)
 
     def _on_queue_double_clicked(self, item: QListWidgetItem) -> None:
         row = self.queue_list.row(item)
@@ -1166,6 +1178,7 @@ class Window(QMainWindow):
         key = self.model_combo.currentData()
         if key:
             self.planner.set_model(key)
+            self._announce_dj(key, prefix="On the decks")
 
     def _open_library(self) -> None:
         """Open the Library viewer (or focus it if already open)."""
