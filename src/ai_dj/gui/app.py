@@ -1487,27 +1487,40 @@ def main() -> int:
     from ai_dj import settings as settings_mod
     from ai_dj.gui.setup import SetupWindow
 
+    def _open_main_window() -> None:
+        """Fit (or load) the projection and open the planner."""
+        cache = projmod.CACHE_PATH
+        if cache.exists():
+            logger.info("loading cached projection from %s", cache)
+            proj = projmod.Projection.load(cache)
+        else:
+            logger.info("fitting projection from Qdrant ...")
+            proj = projmod.fit(idx)
+            proj.save()
+        w = Window(idx, proj)
+        # Keep a strong reference so it doesn't get GC'd when setup closes.
+        app._main_window = w  # type: ignore[attr-defined]
+        w.show()
+
     n_points = idx.client.count(COLLECTION).count
     have_sources = bool(settings_mod.load().library_sources)
-    if n_points == 0 and not have_sources:
-        setup = SetupWindow()
+    if n_points == 0:
+        # Empty index — go through Setup. The SetupWindow runs the
+        # scan+embed pipeline on Teach, then emits indexing_complete; we
+        # close it and open the planner against the now-populated index.
+        setup = SetupWindow(idx)
+
+        def _on_indexed() -> None:
+            setup.close()
+            _open_main_window()
+
+        setup.indexing_complete.connect(_on_indexed)
         setup.show()
-        # Phase 1.5: SetupWindow saves library_sources to settings.json on
-        # Teach. Phase 2.5 will hook a background scan+embed runner here
-        # and transition to the main window when indexing finishes.
+        # Hold a reference so the SetupWindow survives until close.
+        app._setup_window = setup  # type: ignore[attr-defined]
         return app.exec()
 
-    cache = projmod.CACHE_PATH
-    if cache.exists():
-        logger.info("loading cached projection from %s", cache)
-        proj = projmod.Projection.load(cache)
-    else:
-        logger.info("fitting projection from Qdrant ...")
-        proj = projmod.fit(idx)
-        proj.save()
-
-    w = Window(idx, proj)
-    w.show()
+    _open_main_window()
     return app.exec()
 
 
