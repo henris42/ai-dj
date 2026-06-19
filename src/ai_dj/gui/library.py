@@ -14,7 +14,7 @@ from pathlib import Path
 
 import random
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, Signal
 from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -268,34 +268,71 @@ class _ArtistsView(_GroupGrid):
         return QIcon(_placeholder_pixmap(self.ICON, artist, "#4a3340"))
 
 
-class _DiscoverView(QWidget):
-    """First-cut Discover: a re-rollable random sample of the library.
+class _OutliersSignals(QObject):
+    finished = Signal(list)              # list[str] of track ids
 
-    The fully-realised version (bridges between clusters, outliers in
-    sparse regions of the embedding space, twins that share nearest
-    neighbours but never get played together) needs a Qdrant pass per
-    track and a background pre-compute; this view is the empty room
-    that those surfaces land in. Until then: pure serendipity, which is
-    still a step beyond the planner's curated paths."""
+
+class _OutliersTask(QRunnable):
+    def __init__(self, idx: TrackIndex, signals: _OutliersSignals,
+                 sample: int, n: int, refresh: bool) -> None:
+        super().__init__()
+        self.idx = idx
+        self.signals = signals
+        self.sample = sample
+        self.n = n
+        self.refresh = refresh
+
+    def run(self) -> None:
+        from .. import discover as discmod
+        try:
+            ids = discmod.outliers(self.idx, sample=self.sample, n=self.n,
+                                   refresh=self.refresh)
+        except Exception:  # noqa: BLE001
+            ids = []
+        self.signals.finished.emit(ids)
+
+
+class _DiscoverView(QWidget):
+    """Discover: Surprise (random) + Outliers (embedding-driven isolation).
+
+    Bridges, twins, and unexplored regions are next iterations on top of
+    this. Outliers runs in a QThreadPool — first call computes and
+    caches to <bundle>/db/discover_outliers.json, subsequent opens are
+    instant. "Recompute" forces a refresh."""
 
     seed_requested = Signal(str)
-    SAMPLE = 30
+    SAMPLE_RAND = 30
+    SAMPLE_OUT = 250
 
-    def __init__(self, all_rows: list) -> None:
+    def __init__(self, all_rows: list, idx: TrackIndex) -> None:
         super().__init__()
         self._all = all_rows
+        self._row_by_id = {r[0]: r for r in all_rows}
+        self.idx = idx
+        self._pool = QThreadPool.globalInstance()
+        self._signals: _OutliersSignals | None = None
+        self._mode = "surprise"
+
         v = QVBoxLayout(self)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
 
-        row = QHBoxLayout()
-        intro = QLabel("Hidden corners of your library — re-roll for more.")
-        intro.setStyleSheet("color: #aaa;")
-        row.addWidget(intro, stretch=1)
-        reshuffle = QPushButton("Reshuffle")
-        reshuffle.clicked.connect(self._roll)
-        row.addWidget(reshuffle)
-        v.addLayout(row)
+        # Sub-tab buttons
+        subrow = QHBoxLayout()
+        self._sub_buttons: dict[str, QPushButton] = {}
+        for label in ("Surprise", "Outliers"):
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.clicked.connect(lambda _=False, m=label.lower(): self._switch(m))
+            subrow.addWidget(b)
+            self._sub_buttons[label.lower()] = b
+        self._intro = QLabel("Hidden corners of your library — re-roll for more.")
+        self._intro.setStyleSheet("color: #aaa;")
+        subrow.addWidget(self._intro, stretch=1)
+        self.action_btn = QPushButton("Reshuffle")
+        self.action_btn.clicked.connect(self._action)
+        subrow.addWidget(self.action_btn)
+        v.addLayout(subrow)
 
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(("Artist", "Album", "Title", "Genre"))
@@ -311,13 +348,60 @@ class _DiscoverView(QWidget):
         h.setSectionResizeMode(3, QHeaderView.Interactive)
         self.table.itemDoubleClicked.connect(self._on_double_click)
         v.addWidget(self.table, stretch=1)
-        self._roll()
+        self._switch("surprise")
 
-    def _roll(self) -> None:
-        sample = (random.sample(self._all, min(self.SAMPLE, len(self._all)))
+    # ----- mode switching -----
+    def _switch(self, mode: str) -> None:
+        self._mode = mode
+        for k, btn in self._sub_buttons.items():
+            btn.setChecked(k == mode)
+        if mode == "surprise":
+            self._intro.setText("Hidden corners of your library — re-roll for more.")
+            self.action_btn.setText("Reshuffle")
+            self.action_btn.setEnabled(True)
+            self._roll_surprise()
+        else:
+            self._intro.setText(
+                "Outliers — tracks the embedding finds isolated. "
+                "(First compute may take ~10–30 s; cached afterwards.)")
+            self.action_btn.setText("Recompute")
+            self._load_outliers(refresh=False)
+
+    def _action(self) -> None:
+        if self._mode == "surprise":
+            self._roll_surprise()
+        else:
+            self._load_outliers(refresh=True)
+
+    # ----- surprise -----
+    def _roll_surprise(self) -> None:
+        sample = (random.sample(self._all, min(self.SAMPLE_RAND, len(self._all)))
                   if self._all else [])
-        self.table.setRowCount(len(sample))
-        for r, (tid, artist, album, title, _dur, genre) in enumerate(sample):
+        self._fill_rows(sample)
+
+    # ----- outliers -----
+    def _load_outliers(self, *, refresh: bool) -> None:
+        self.action_btn.setEnabled(False)
+        self._fill_rows([])
+        self._intro.setText("Computing outliers…")
+        self._signals = _OutliersSignals()
+        self._signals.finished.connect(self._on_outliers, Qt.QueuedConnection)
+        self._pool.start(_OutliersTask(
+            self.idx, self._signals,
+            sample=self.SAMPLE_OUT, n=self.SAMPLE_RAND, refresh=refresh))
+
+    def _on_outliers(self, ids: list) -> None:
+        rows = [self._row_by_id[tid] for tid in ids if tid in self._row_by_id]
+        self._fill_rows(rows)
+        self.action_btn.setEnabled(True)
+        self._intro.setText(
+            f"Outliers — {len(rows)} most isolated tracks "
+            "(re-compute to refresh after Teach adds new music).")
+
+    # ----- shared -----
+    def _fill_rows(self, rows) -> None:
+        self.table.setRowCount(len(rows))
+        for r, (tid, artist, album, title, _dur, genre) in enumerate(rows):
             for c, val in enumerate((artist, album, title, genre)):
                 it = QTableWidgetItem(val)
                 if c == 0:
@@ -382,7 +466,7 @@ class LibraryWindow(QMainWindow):
         self.artists.seed_requested.connect(self.seed_requested)
         self.stack.addWidget(self.artists)
 
-        self.discover = _DiscoverView(self.songs._all_rows)
+        self.discover = _DiscoverView(self.songs._all_rows, idx)
         self.discover.seed_requested.connect(self.seed_requested)
         self.stack.addWidget(self.discover)
 
