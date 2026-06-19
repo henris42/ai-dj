@@ -1,0 +1,64 @@
+name: test
+
+# Fast feedback CI: install + compile + headless module import.
+# Runs on every push and pull request to main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: install + compile + import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Python 3.11
+        run: uv python install 3.11
+
+      - name: libmpv
+        run: sudo apt-get update && sudo apt-get install -y libmpv2
+
+      - name: Sync deps
+        run: uv sync --no-dev
+
+      - name: Compile every Python module
+        run: |
+          uv run python -m compileall -q src/ scripts/ start_windows.py
+        # `-q` keeps output minimal; the command's exit code is what we care
+        # about. Any SyntaxError surfaces here.
+
+      - name: Headless module-import smoke
+        run: |
+          uv run python - <<'PY'
+          # Each top-level ai_dj module should import without the full ML
+          # stack present. The heavy embed/indexer paths defer their torch
+          # imports until call time on purpose.
+          import importlib
+          for mod in (
+              "ai_dj.config",
+              "ai_dj.scan",
+              "ai_dj.index",
+              "ai_dj.paths",
+              "ai_dj.path",
+              "ai_dj.player",
+              "ai_dj.photos",
+              "ai_dj.settings",
+              "ai_dj.sets",
+              "ai_dj.discover",
+              "ai_dj.indexer",
+              "ai_dj.ai_engine",
+              "ai_dj.styles",
+          ):
+              importlib.import_module(mod)
+              print("OK", mod)
+          PY

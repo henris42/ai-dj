@@ -1,0 +1,124 @@
+name: release
+
+# Build a per-OS bundle of AI DJ via PyInstaller on tag push.
+# Output: dist artifacts attached to the GitHub Release.
+#
+# Triggered by a tag matching v*.*.* (e.g. v0.2.0). Each runner builds the
+# native bundle for its OS using the same aidj.spec — the spec is OS-aware
+# (libmpv handling, icon, hidden imports).
+#
+# This builds the *player* bundle. The embedding stack (torch / transformers
+# / librosa) is intentionally excluded from aidj.spec — first-run AI engine
+# install lives in ai_dj.ai_engine and the GUI's SetupWindow walks the user
+# through it, keeping the installer light.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:                       # allow manual trigger for testing
+
+permissions:
+  contents: write                          # needed to attach Release assets
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: ai-dj-windows
+            artifact_glob: 'dist/AI DJ'
+            archive_ext: zip
+          - os: macos-latest
+            artifact_name: ai-dj-macos
+            artifact_glob: 'dist/AI DJ.app'
+            archive_ext: zip
+          - os: ubuntu-latest
+            artifact_name: ai-dj-linux
+            artifact_glob: 'dist/AI DJ'
+            archive_ext: tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      # Linux needs libmpv at the system level so python-mpv finds it at
+      # bundle time. Windows ships libmpv-2.dll in the repo root; macOS
+      # uses brew's libmpv.
+      - name: Install libmpv (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libmpv2
+
+      - name: Install libmpv (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install mpv
+
+      - name: Sync project deps
+        # We only need the runtime player stack — torch / transformers /
+        # librosa are excluded from the bundle and installed at first run.
+        run: |
+          uv sync --no-dev
+
+      - name: Install PyInstaller
+        run: uv pip install pyinstaller
+
+      - name: Build bundle
+        run: uv run pyinstaller aidj.spec
+
+      - name: Archive bundle (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cd dist
+          Compress-Archive -Path "AI DJ" -DestinationPath "${{ matrix.artifact_name }}.zip"
+        shell: pwsh
+
+      - name: Archive bundle (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cd dist
+          zip -ry "${{ matrix.artifact_name }}.zip" "AI DJ.app"
+
+      - name: Archive bundle (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd dist
+          tar czf "${{ matrix.artifact_name }}.tar.gz" "AI DJ"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/${{ matrix.artifact_name }}.zip
+            dist/${{ matrix.artifact_name }}.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
