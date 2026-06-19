@@ -476,6 +476,13 @@ class Window(QMainWindow):
         self.new_mix_btn.clicked.connect(self.start_mix)
         transport.addWidget(self.new_mix_btn)
 
+        self.library_btn = QPushButton("📚  Library")
+        self.library_btn.setToolTip("Browse your full library — pick any track "
+                                    "as a seed for the planner")
+        self.library_btn.clicked.connect(self._open_library)
+        transport.addWidget(self.library_btn)
+        self._library_window = None
+
         # Auto "new DJ": every N hours, reshuffle the Steer categories and
         # start a fresh path — unlike "New mix" this *changes* categories.
         self.autodj_chk = QCheckBox("New DJ every")
@@ -1159,6 +1166,34 @@ class Window(QMainWindow):
         if key:
             self.planner.set_model(key)
 
+    def _open_library(self) -> None:
+        """Open the Library viewer (or focus it if already open)."""
+        from ai_dj.gui.library import LibraryWindow
+        if self._library_window is None or not self._library_window.isVisible():
+            self._library_window = LibraryWindow(self.idx, parent=self)
+            self._library_window.seed_requested.connect(self.start_mix_from)
+        self._library_window.show()
+        self._library_window.raise_()
+        self._library_window.activateWindow()
+
+    def start_mix_from(self, track_id: str) -> None:
+        """Seed the planner from a specific track id (e.g. picked in the
+        Library viewer or dropped onto the window)."""
+        rec = self.idx.client.retrieve(
+            COLLECTION, [track_id], with_payload=True, with_vectors=False,
+        )
+        if not rec:
+            logger.warning("start_mix_from: unknown track id %s", track_id)
+            return
+        seed = planpath.planned_from_payload(track_id, rec[0].payload or {})
+        self.upcoming.clear()
+        self.played_ever = set()
+        self.history_list = []
+        self.history_cursor = -1
+        self._play_track(seed, is_seed=True)
+        self._refill_queue()
+        self._refresh_all()
+
     def _on_artist_input_submit(self) -> None:
         name = self.artist_input.text().strip()
         if not name:
@@ -1393,6 +1428,22 @@ def main() -> int:
 
     idx = TrackIndex()
     idx.ensure_collection()
+
+    # First-launch UX: empty index *and* no library sources configured →
+    # gather music folders from the user before opening the planner.
+    # Existing installs (non-empty index) skip straight to the main window.
+    from ai_dj import settings as settings_mod
+    from ai_dj.gui.setup import SetupWindow
+
+    n_points = idx.client.count(COLLECTION).count
+    have_sources = bool(settings_mod.load().library_sources)
+    if n_points == 0 and not have_sources:
+        setup = SetupWindow()
+        setup.show()
+        # Phase 1.5: SetupWindow saves library_sources to settings.json on
+        # Teach. Phase 2.5 will hook a background scan+embed runner here
+        # and transition to the main window when indexing finishes.
+        return app.exec()
 
     cache = projmod.CACHE_PATH
     if cache.exists():
