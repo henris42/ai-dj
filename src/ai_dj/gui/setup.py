@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QStackedWidget,
@@ -71,6 +72,28 @@ class _IndexerTask(QRunnable):
         self.signals.finished.emit(result)
 
 
+class _EngineInstallSignals(QObject):
+    line = Signal(str)
+    finished = Signal(int)               # returncode (0 = OK)
+
+
+class _EngineInstallTask(QRunnable):
+    """Runs the AI-engine install via `uv pip install`, streaming each
+    output line back to the GUI."""
+
+    def __init__(self, signals: _EngineInstallSignals) -> None:
+        super().__init__()
+        self.signals = signals
+
+    def run(self) -> None:
+        from .. import ai_engine
+        rc = ai_engine.install(
+            project_root=Path(__file__).resolve().parents[3],
+            on_line=lambda s: self.signals.line.emit(s),
+        )
+        self.signals.finished.emit(rc)
+
+
 class SetupWindow(QMainWindow):
     """First-launch screen. Add sources → Teach → indexer runs → planner.
 
@@ -92,8 +115,9 @@ class SetupWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
-        self.stack.addWidget(self._build_sources_page())
-        self.stack.addWidget(self._build_indexing_page())
+        self.stack.addWidget(self._build_sources_page())          # 0
+        self.stack.addWidget(self._build_engine_page())           # 1
+        self.stack.addWidget(self._build_indexing_page())         # 2
 
         self._reload_from_settings()
 
@@ -196,7 +220,80 @@ class SetupWindow(QMainWindow):
         sources = settings_mod.load().library_sources
         if not sources:
             return
+        # If the embedding stack isn't installed yet, walk through engine
+        # install first; the indexing page kicks in after a successful pip.
+        from .. import ai_engine
+        if not ai_engine.is_available():
+            self._pending_sources = sources
+            self._engine_missing.setText(
+                "AI engine missing: " + ", ".join(ai_engine.missing()))
+            self.stack.setCurrentIndex(1)
+            return
         self._start_indexing(sources)
+
+    # ===== engine install page =====
+    def _build_engine_page(self) -> QWidget:
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(24, 22, 24, 22)
+        v.setSpacing(8)
+
+        title = QLabel("<h2 style='margin:0'>Install the AI engine</h2>")
+        title.setTextFormat(Qt.RichText)
+        v.addWidget(title)
+
+        intro = QLabel(
+            "AI DJ needs the embedding engine (torch + transformers + librosa) "
+            "to learn how your tracks sound. This is a one-time install of "
+            "roughly 1–2 GB, fetched via uv.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #bbb;")
+        v.addWidget(intro)
+
+        self._engine_missing = QLabel("")
+        self._engine_missing.setStyleSheet("color: #888;")
+        v.addWidget(self._engine_missing)
+
+        self._engine_log = QPlainTextEdit()
+        self._engine_log.setReadOnly(True)
+        self._engine_log.setStyleSheet("font-family: monospace; font-size: 11px;")
+        v.addWidget(self._engine_log, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self._engine_back_btn = QPushButton("Back")
+        self._engine_back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        btn_row.addWidget(self._engine_back_btn)
+        self._engine_install_btn = QPushButton("Install AI engine")
+        self._engine_install_btn.setStyleSheet(
+            "QPushButton { padding: 8px 18px; font-weight: bold; }")
+        self._engine_install_btn.clicked.connect(self._on_engine_install)
+        btn_row.addWidget(self._engine_install_btn)
+        v.addLayout(btn_row)
+        return page
+
+    def _on_engine_install(self) -> None:
+        self._engine_install_btn.setEnabled(False)
+        self._engine_back_btn.setEnabled(False)
+        self._engine_log.appendPlainText("Starting AI engine install — this may take several minutes.\n")
+        self._engine_signals = _EngineInstallSignals()
+        self._engine_signals.line.connect(self._engine_log.appendPlainText,
+                                          Qt.QueuedConnection)
+        self._engine_signals.finished.connect(self._on_engine_finished,
+                                              Qt.QueuedConnection)
+        self._pool.start(_EngineInstallTask(self._engine_signals))
+
+    @Slot(int)
+    def _on_engine_finished(self, rc: int) -> None:
+        from .. import ai_engine
+        if rc == 0 and ai_engine.is_available():
+            self._engine_log.appendPlainText("\nAI engine installed. Continuing with Teach.")
+            if getattr(self, "_pending_sources", None):
+                self._start_indexing(self._pending_sources)
+        else:
+            self._engine_log.appendPlainText(f"\nInstall failed (code {rc}).")
+            self._engine_install_btn.setEnabled(True)
+            self._engine_back_btn.setEnabled(True)
 
     # ===== indexing page =====
     def _build_indexing_page(self) -> QWidget:
@@ -238,7 +335,7 @@ class SetupWindow(QMainWindow):
         # Disable the source page controls so the user can't re-Teach mid-run.
         for w in (self.add_btn, self.remove_btn, self.teach_btn, self.sources_list):
             w.setEnabled(False)
-        self.stack.setCurrentIndex(1)
+        self.stack.setCurrentIndex(2)            # indexing page (engine page is 1)
 
         self._signals = _IndexerSignals()
         self._signals.progress.connect(self._on_progress, Qt.QueuedConnection)
