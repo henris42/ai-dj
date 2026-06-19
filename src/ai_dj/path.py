@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PlannedTrack:
     track_id: str
-    path: str
+    rel_path: str               # POSIX, relative to the library root
     title: str | None
     artist: str | None
     album: str | None
@@ -34,9 +34,12 @@ class PlannedTrack:
 
 
 def planned_from_payload(track_id: str, payload: dict) -> PlannedTrack:
+    # Prefer the new `rel_path` payload key; fall back to the legacy `path`
+    # for un-migrated points so playback works during the migration window.
+    rel = payload.get("rel_path") or payload.get("path") or ""
     return PlannedTrack(
         track_id=track_id,
-        path=payload["path"],
+        rel_path=rel,
         title=payload.get("title"),
         artist=payload.get("artist"),
         album=payload.get("album"),
@@ -47,27 +50,46 @@ def planned_from_payload(track_id: str, payload: dict) -> PlannedTrack:
 
 
 class Planner:
+    # Selectable next-track math. The randomness knob feeds whichever is
+    # active; each interprets it sensibly. Order = combo-box order.
+    MODELS: tuple[str, ...] = ("classic", "gaussian", "directed")
+    MODEL_LABELS: dict[str, str] = {
+        "classic": "Classic",        # softmax over cosine — the original mixes
+        "gaussian": "Gaussian drift",  # half-normal core + long-jump tail
+        "directed": "Directed",      # Gaussian + forward heading (momentum)
+    }
+
     def __init__(
         self,
         idx: TrackIndex,
-        # Path planning is supposed to find *clever* relations through the
-        # embedding — not the most obvious match each step. The closest
-        # cosine-neighbour to a track is usually the same artist's next
-        # song, a remix, an alternate mix. Skipping the top few and
-        # sampling with moderate temperature picks the second/third order
-        # of relatedness — tracks that are related but not the obvious
-        # continuation, which is where the interesting drift comes from.
-        temperature: float = 0.6,
+        # The next track is chosen by its *rank* in the similarity-sorted
+        # neighbour pool (rank 0 = nearest) using an explicit mixture model:
+        #
+        #   • a half-normal (folded Gaussian) core over rank — most picks land
+        #     near the top, with a smooth bell falloff. `randomness` sets the
+        #     Gaussian's sigma (in rank units): ~0 ⇒ effectively always the
+        #     nearest sensible track; large ⇒ the bell spreads across the pool.
+        #   • a small-probability long-jump component that deliberately picks
+        #     from the *far* part of the pool (weighted toward the far end).
+        #     A pure Gaussian has thin tails and almost never jumps far; this
+        #     term is the controlled fat tail — "sometimes go pretty far".
+        #
+        # Skipping the top few neighbours still applies first: the closest
+        # cosine match is usually the same artist / a remix, not an
+        # interesting continuation.
+        randomness: float = 0.30,        # 0 = coherent, 1 = wild; drives sigma + jump prob
         base_k: int = 18,
         expand_k: int = 100,
+        pool_k: int = 64,                # neighbours fetched unfiltered, so the far tail is real
         skip_top: int = 3,
         seed: int | None = None,
     ):
         self.idx = idx
         self.client = idx.client
-        self.temperature = temperature
+        self.randomness = min(1.0, max(0.0, float(randomness)))
         self.base_k = base_k
         self.expand_k = expand_k
+        self.pool_k = pool_k
         self.skip_top = skip_top
         # Default to a fresh time-based seed each instance so "New mix" gives
         # a different track on every launch even if the user's first action
@@ -75,6 +97,60 @@ class Planner:
         self.rng = random.Random(seed if seed is not None else time.time_ns())
         self.active_styles: set[str] = set()
         self.restrict_artists: set[str] = set()
+        # Default to Classic so out-of-the-box behaviour is exactly the
+        # proven-good softmax mixes; the other models are opt-in.
+        self.model = "classic"
+        self.direction_step = 0.5  # how far the Directed model leads the query
+
+    def set_randomness(self, randomness: float) -> None:
+        """Live 'randomness' knob, in [0, 1]. 0 ≈ always take the closest
+        sensible match (coherent, predictable). Higher widens the Gaussian
+        core and raises the long-jump probability so the path makes bigger,
+        occasionally far, jumps. Applies from the next `plan_next` onward.
+
+        The default (~0.30) is calibrated to reproduce the prior softmax
+        behaviour — the mixes that already work — so the knob only changes
+        character when the user actually moves it."""
+        self.randomness = min(1.0, max(0.0, float(randomness)))
+
+    def set_model(self, model: str) -> None:
+        """Switch the next-track math live. Unknown names are ignored so a
+        stale UI value can't break planning."""
+        if model in self.MODELS:
+            self.model = model
+
+    def _pick_softmax(self, hits: list) -> int:
+        """Original 'Classic' selection: Boltzmann sample over cosine score.
+        `randomness` maps to the softmax temperature so the one knob still
+        works for this model (0 → near-argmax, 1 → flat)."""
+        temp = 0.10 + self.randomness * 1.40
+        scores = np.array([h.score for h in hits], dtype=np.float32)
+        logits = scores / max(temp, 1e-6)
+        logits -= logits.max()
+        probs = np.exp(logits)
+        probs = probs / probs.sum()
+        return self.rng.choices(range(len(hits)), weights=probs.tolist(), k=1)[0]
+
+    # --- sampling math -------------------------------------------------
+    # rank pick = mixture of a half-normal core and a far long-jump.
+    def _pick_rank(self, n_core: int, n_far: int) -> tuple[bool, int]:
+        """Return (use_far, index). `index` is into the core list when
+        use_far is False, else into the far list."""
+        r = self.randomness
+        # Long-jump probability: small even when wild. Pure-Gaussian tails are
+        # too thin to ever "go pretty far", so this is the explicit fat tail.
+        p_far = 0.02 + 0.18 * r
+        if n_far > 0 and self.rng.random() < p_far:
+            # Pick from the far pool, weighted linearly toward the far end so
+            # a jump is genuinely a jump, not just past the core boundary.
+            weights = [i + 1 for i in range(n_far)]
+            j = self.rng.choices(range(n_far), weights=weights, k=1)[0]
+            return True, j
+        # Half-normal (folded Gaussian) over core rank. sigma in rank units:
+        # r=0 → ~0.35 (rank 0 almost always), r=1 → spans the core.
+        sigma = 0.35 + r * 0.65 * max(1, n_core - 1)
+        j = int(round(abs(self.rng.gauss(0.0, 1.0)) * sigma))
+        return False, min(n_core - 1, j)
 
     def set_styles(self, active: set[str]) -> None:
         self.active_styles = set(active)
@@ -188,6 +264,28 @@ class Planner:
                 ctx_w.append(w)
         if not ctx_vecs:
             return current_id
+
+        if self.model == "directed":
+            # Directed walk: estimate "where I've been" as the weighted mean
+            # of recent context, take heading = current − past, and push the
+            # query *ahead* of the current point along that heading. This
+            # gives the path momentum (a directed traversal of the kNN graph)
+            # instead of a current+past blend that can curl backward.
+            cw = np.asarray(ctx_w, dtype=np.float32)
+            recent_centroid = (np.stack(ctx_vecs) * cw[:, None]).sum(axis=0) / cw.sum()
+            heading = cur_vec - recent_centroid
+            hn = float(np.linalg.norm(heading))
+            if hn > 1e-9:
+                q = cur_vec + self.direction_step * (heading / hn)
+            else:
+                q = cur_vec  # no clear heading yet — fall back to current
+            n = float(np.linalg.norm(q))
+            if n > 1e-9:
+                q = q / n
+            return q.astype(np.float32).tolist()
+
+        # Classic / Gaussian: centroid of current (weight 1.0) + decayed
+        # recent history. Anchored around the current pivot.
         stacked = np.stack([cur_vec, *ctx_vecs])
         weights = np.asarray([1.0, *ctx_w], dtype=np.float32)
         centroid = (stacked * weights[:, None]).sum(axis=0) / weights.sum()
@@ -216,7 +314,7 @@ class Planner:
         just the immediate pivot. `current` is weighted heavily so the path
         still drifts and doesn't get glued to the cluster the recent history
         sits in."""
-        k = self.expand_k if (self.active_styles or self.restrict_artists) else self.base_k
+        k = self.expand_k if (self.active_styles or self.restrict_artists) else self.pool_k
         query_arg = self._build_query_vector(current.track_id, context_ids)
         hits = self.client.query_points(
             COLLECTION,
@@ -242,17 +340,24 @@ class Planner:
                 candidates = filtered
 
         # Skip the most-obvious top matches (same artist's other songs,
-        # remixes, etc.) — but only when there's enough pool left to keep
-        # the path moving under tight filters.
+        # remixes, etc.) when there's pool to spare — the closest cosine
+        # match is rarely an interesting continuation.
         if len(candidates) > self.skip_top + 4:
-            candidates = candidates[self.skip_top : self.skip_top + self.base_k]
+            candidates = candidates[self.skip_top :]
+
+        # Split the similarity-sorted pool: the `base_k` core feeds the
+        # Gaussian; everything beyond it is the long-jump reach (only
+        # populated because the unfiltered fetch now pulls `pool_k`).
+        core = candidates[: self.base_k]
+        far = candidates[self.base_k :]
+
+        if self.model == "classic":
+            # Original behaviour, preserved bit-for-bit: softmax over the
+            # core window, no long jumps, centroid retrieval.
+            chosen = core[self._pick_softmax(core)]
         else:
-            candidates = candidates[: self.base_k]
-        scores = np.array([h.score for h in candidates], dtype=np.float32)
-        logits = scores / max(self.temperature, 1e-6)
-        logits -= logits.max()
-        probs = np.exp(logits)
-        probs = probs / probs.sum()
-        pick = self.rng.choices(range(len(candidates)), weights=probs.tolist(), k=1)[0]
-        chosen = candidates[pick]
+            # Gaussian drift / Directed both use the half-normal + long-jump
+            # rank sampler; they differ only in the query vector built above.
+            use_far, j = self._pick_rank(len(core), len(far))
+            chosen = far[j] if use_far else core[j]
         return planned_from_payload(str(chosen.id), chosen.payload or {})

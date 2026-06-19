@@ -6,9 +6,21 @@ next on the same player, which gives gapless back-to-back playback."""
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Callable
+
+if sys.platform == "win32":
+    # python-mpv locates libmpv by scanning the %PATH% string itself (not the
+    # Win32 DLL search dirs, so os.add_dll_directory doesn't help). For
+    # Windows-native runs we ship libmpv-2.dll in the project root; prepend it
+    # to PATH before `import mpv` (no-op on WSL, which uses system libmpv).
+    _root = Path(__file__).resolve().parents[2]
+    if (_root / "libmpv-2.dll").exists():
+        os.environ["PATH"] = str(_root) + os.pathsep + os.environ.get("PATH", "")
 
 import mpv
 

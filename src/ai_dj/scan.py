@@ -19,8 +19,16 @@ _NS = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")  # stable namespace for 
 
 @dataclass(frozen=True)
 class TrackMeta:
+    """Per-track scan result.
+
+    Identity is `uuid5(_NS, rel_path)` where `rel_path` is the file's POSIX
+    path **relative to its library root** — so a track keeps the same id
+    when the library directory itself moves (different machine, different
+    drive letter, WSL vs Windows), and a prebuilt index ships portably.
+    The absolute path is recoverable on demand via the library's root."""
+
     track_id: str
-    path: str
+    rel_path: str               # POSIX, relative to the library root
     title: str | None
     artist: str | None
     album: str | None
@@ -36,7 +44,13 @@ def _first(v):
     return v
 
 
-def _parse(path: Path) -> TrackMeta | None:
+def rel_track_id(rel_path: str) -> str:
+    """uuid5 over the POSIX rel-path. Same id regardless of where the
+    library is mounted, as long as the in-library structure is unchanged."""
+    return str(uuid.uuid5(_NS, rel_path))
+
+
+def _parse(path: Path, root: Path) -> TrackMeta | None:
     try:
         tags = mutagen.File(path, easy=True)
     except Exception as e:
@@ -47,9 +61,10 @@ def _parse(path: Path) -> TrackMeta | None:
 
     duration = getattr(tags.info, "length", None) if getattr(tags, "info", None) else None
     meta = dict(tags) if tags else {}
+    rel = path.relative_to(root).as_posix()
     return TrackMeta(
-        track_id=str(uuid.uuid5(_NS, str(path))),
-        path=str(path),
+        track_id=rel_track_id(rel),
+        rel_path=rel,
         title=_first(meta.get("title")),
         artist=_first(meta.get("artist")) or _first(meta.get("albumartist")),
         album=_first(meta.get("album")),
@@ -59,7 +74,11 @@ def _parse(path: Path) -> TrackMeta | None:
 
 
 def iter_library(root: Path) -> Iterator[TrackMeta]:
-    """Yield TrackMeta for every playable audio file under root. Skips DRM + unreadable files."""
+    """Yield TrackMeta for every playable audio file under `root`. Skips DRM
+    + unreadable files. Identity is derived from the path *relative to root*
+    so call sites can iterate multiple roots and the ids stay stable across
+    moves of the library."""
+    root = root.resolve()
     for p in root.rglob("*"):
         if not p.is_file():
             continue
@@ -72,6 +91,6 @@ def iter_library(root: Path) -> Iterator[TrackMeta]:
             continue
         if ext not in AUDIO_EXTS:
             continue
-        meta = _parse(p)
+        meta = _parse(p, root)
         if meta is not None:
             yield meta

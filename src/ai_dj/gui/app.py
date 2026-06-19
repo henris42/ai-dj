@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import random
 import subprocess
 import sys
 import time
@@ -30,13 +31,16 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
-from PySide6.QtCore import QPointF, QSize, Qt, QStringListModel, QTimer, Signal
+from PySide6.QtCore import (QPointF, QRunnable, QSize, Qt, QStringListModel,
+                            QThreadPool, QTimer, Signal)
 from PySide6.QtGui import QColor, QCursor, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import QButtonGroup, QToolTip
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QCompleter,
+    QDial,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -49,6 +53,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
+    QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -119,7 +124,8 @@ class TrackInfoDialog(QDialog):
         v.setContentsMargins(14, 12, 14, 12)
         v.setSpacing(6)
 
-        title = payload.get("title") or Path(payload.get("path") or "").stem or "(unknown)"
+        _stem_src = payload.get("rel_path") or payload.get("path") or ""
+        title = payload.get("title") or Path(_stem_src).stem or "(unknown)"
         artist = payload.get("artist") or "?"
         album = payload.get("album") or "—"
         dur = payload.get("duration_s")
@@ -161,7 +167,12 @@ class TrackInfoDialog(QDialog):
             v.addLayout(row)
 
         v.addSpacing(10)
-        path = payload.get("path") or ""
+        # Display the *absolute* path the user can copy / reveal — payload
+        # carries a rel_path, paths.resolve_for_player joins with the music
+        # root. Legacy points still carrying `path` resolve through the
+        # same function unchanged.
+        from ai_dj.paths import resolve_for_player as _resolve
+        path = _resolve(payload.get("rel_path") or payload.get("path") or "")
         path_label = QLabel(path)
         path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         path_label.setWordWrap(True)
@@ -346,6 +357,29 @@ class QueueRow(QWidget):
         h.addWidget(remove_btn)
 
 
+class _PhotoFetchTask(QRunnable):
+    """Background worker that fetches public photos for one artist. Pure
+    network + file I/O — no Qt calls — so it's thread-safe. The Ken Burns
+    visualizer (once active) just sees new files appear in Photos/<Artist>/."""
+
+    def __init__(self, artist: str, photo_root: "Path", target: int,
+                 on_done) -> None:
+        super().__init__()
+        self.artist = artist
+        self.photo_root = photo_root
+        self.target = target
+        self._on_done = on_done
+
+    def run(self) -> None:
+        from ai_dj import photos as photosmod
+        try:
+            photosmod.fetch_for_artist(self.artist, self.photo_root, self.target)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            self._on_done(self.artist)
+
+
 class Window(QMainWindow):
     def __init__(self, idx: TrackIndex, proj: projmod.Projection):
         super().__init__()
@@ -356,6 +390,13 @@ class Window(QMainWindow):
         self.proj = proj
         self.planner = planpath.Planner(idx)
         self.player = playermod.Player(crossfade_enabled=False, crossfade_seconds=6.0)
+
+        # Auto-fetch artist photos while playing. Single worker thread keeps
+        # us polite to Wikimedia, and the inflight set stops re-queueing the
+        # same artist while a fetch is in progress.
+        self._photo_pool = QThreadPool(self)
+        self._photo_pool.setMaxThreadCount(1)
+        self._photo_inflight: set[str] = set()
 
         # State
         self.current: planpath.PlannedTrack | None = None
@@ -430,9 +471,25 @@ class Window(QMainWindow):
         transport.addSpacing(20)
 
         self.new_mix_btn = QPushButton("🎲  New mix")
-        self.new_mix_btn.setToolTip("Pick a random seed and rebuild the path")
+        self.new_mix_btn.setToolTip("New seed within the current categories "
+                                    "(keeps your Steer selection)")
         self.new_mix_btn.clicked.connect(self.start_mix)
         transport.addWidget(self.new_mix_btn)
+
+        # Auto "new DJ": every N hours, reshuffle the Steer categories and
+        # start a fresh path — unlike "New mix" this *changes* categories.
+        self.autodj_chk = QCheckBox("New DJ every")
+        self.autodj_chk.setToolTip("Periodically pick fresh random categories "
+                                   "and start over, like a shift change")
+        self.autodj_chk.toggled.connect(self._on_autodj_toggle)
+        transport.addWidget(self.autodj_chk)
+        self.autodj_hours = QSpinBox()
+        self.autodj_hours.setRange(1, 24)
+        self.autodj_hours.setValue(3)
+        self.autodj_hours.setSuffix(" h")
+        self.autodj_hours.setFixedWidth(56)
+        self.autodj_hours.valueChanged.connect(self._on_autodj_hours)
+        transport.addWidget(self.autodj_hours)
 
         transport.addSpacing(20)
 
@@ -447,7 +504,56 @@ class Window(QMainWindow):
         transport.addWidget(self.xfade_slider)
         self.xfade_label = QLabel("6s")
         transport.addWidget(self.xfade_label)
+
         transport.addStretch(1)
+
+        # Big "Randomness" knob — drives the planner's sampling temperature
+        # live. Left = coherent / predictable picks, right = bigger, more
+        # surprising jumps through the embedding space.
+        rnd_col = QVBoxLayout()
+        rnd_col.setSpacing(0)
+        rnd_caption = QLabel("Randomness")
+        rnd_caption.setAlignment(Qt.AlignHCenter)
+        rnd_col.addWidget(rnd_caption)
+        self.rnd_dial = QDial()
+        self.rnd_dial.setRange(0, 100)
+        self.rnd_dial.setNotchesVisible(True)
+        self.rnd_dial.setFixedSize(64, 64)
+        self.rnd_dial.setToolTip(
+            "How adventurous the next-track picks are.\n"
+            "Low = stays close (coherent) · High = bigger jumps (surprising)"
+        )
+        self.rnd_dial.setValue(int(round(self.planner.randomness * 100)))
+        self.rnd_dial.valueChanged.connect(self._on_randomness)
+        rnd_col.addWidget(self.rnd_dial, alignment=Qt.AlignHCenter)
+        self.rnd_label = QLabel()
+        self.rnd_label.setAlignment(Qt.AlignHCenter)
+        rnd_col.addWidget(self.rnd_label)
+        transport.addLayout(rnd_col)
+        self._on_randomness(self.rnd_dial.value())  # sync the value label
+
+        # Model picker, beside the knob: chooses which math the knob drives.
+        model_col = QVBoxLayout()
+        model_col.setSpacing(0)
+        model_caption = QLabel("Model")
+        model_caption.setAlignment(Qt.AlignHCenter)
+        model_col.addWidget(model_caption)
+        self.model_combo = QComboBox()
+        for key in planpath.Planner.MODELS:
+            self.model_combo.addItem(planpath.Planner.MODEL_LABELS[key], key)
+        self.model_combo.setToolTip(
+            "Classic — original softmax mixes\n"
+            "Gaussian drift — bell-curve picks + occasional far jump\n"
+            "Directed — Gaussian plus forward momentum through the space"
+        )
+        idx = self.model_combo.findData(self.planner.model)
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        model_col.addWidget(self.model_combo)
+        model_col.addStretch(1)
+        transport.addLayout(model_col)
+
         outer.addLayout(transport)
 
         # Artists filter row (pin 1-N artists -> mix is restricted to their tracks)
@@ -619,6 +725,10 @@ class Window(QMainWindow):
         self.anim_timer.timeout.connect(self._anim_tick)
         self.anim_timer.start()
         self._anim_t = 0.0
+
+        # "New DJ" shift-change timer (hours). Off until the user enables it.
+        self.dj_timer = QTimer(self)
+        self.dj_timer.timeout.connect(self._new_dj)
 
     def _wire_context_menus(self) -> None:
         """Right-click on any track-bearing widget → "Track info..." menu."""
@@ -857,6 +967,25 @@ class Window(QMainWindow):
             pass
         self._reflect_play_state(playing=False)
 
+    def _maybe_fetch_photos(self, artist: str) -> None:
+        """If the current artist has no photos yet, kick a background fetch.
+        Single-threaded pool stays polite to Wikimedia; the inflight set
+        stops re-queueing the same artist while a fetch is in progress.
+        Skip silently if the network module isn't importable yet."""
+        if artist in self._photo_inflight:
+            return
+        try:
+            from ai_dj import photos as photosmod
+        except ImportError:
+            return
+        root = photosmod.photo_root()
+        target = 3                       # modest on-demand budget per artist
+        if photosmod.already_have(root / photosmod.safe(artist), target):
+            return
+        self._photo_inflight.add(artist)
+        self._photo_pool.start(_PhotoFetchTask(
+            artist, root, target, self._photo_inflight.discard))
+
     def _play_track(self, track: planpath.PlannedTrack, *, push_history: bool = True,
                     is_seed: bool = False) -> None:  # noqa: ARG002
         """Play `track` and (optionally) record it in history.
@@ -875,12 +1004,14 @@ class Window(QMainWindow):
         self.current = track
         self.played_ever.add(track.track_id)
         self._last_poll_advanced_for = None
+        if track.artist:
+            self._maybe_fetch_photos(track.artist)
         self._track_started_at = time.monotonic()
         self._reflect_play_state(playing=True)
         try:
-            self.player.play(track.path)
+            self.player.play(track.rel_path)
         except Exception as e:  # noqa: BLE001
-            logger.exception("player.play failed for %s: %s", track.path, e)
+            logger.exception("player.play failed for %s: %s", track.rel_path, e)
 
     def _reflect_play_state(self, playing: bool) -> None:
         """Sync the play/pause button label with reality without re-triggering the toggle."""
@@ -952,6 +1083,34 @@ class Window(QMainWindow):
         self._refresh_map_highlights()
         self._refresh_upcoming_path()
 
+    # ---------- auto "new DJ" ----------
+    def _autodj_interval_ms(self) -> int:
+        return self.autodj_hours.value() * 3600 * 1000
+
+    def _on_autodj_toggle(self, on: bool) -> None:
+        if on:
+            self.dj_timer.start(self._autodj_interval_ms())
+        else:
+            self.dj_timer.stop()
+
+    def _on_autodj_hours(self, _v: int) -> None:
+        # Restart the countdown with the new period if it's currently running.
+        if self.dj_timer.isActive():
+            self.dj_timer.start(self._autodj_interval_ms())
+
+    def _new_dj(self) -> None:
+        """Shift change: pick fresh random Steer categories, then start a new
+        path. Distinct from 'New mix', which keeps the current categories."""
+        names = list(stylesmod.STYLES.keys())
+        chosen = set(random.sample(names, random.randint(1, 2)))
+        self.active_styles = set(chosen)
+        for name, btn in self.style_buttons.items():
+            btn.blockSignals(True)            # set state without 12x replans
+            btn.setChecked(name in chosen)
+            btn.blockSignals(False)
+        self.planner.set_styles(self.active_styles)
+        self.start_mix()                       # new seed + rebuild within them
+
     def _on_queue_double_clicked(self, item: QListWidgetItem) -> None:
         row = self.queue_list.row(item)
         if row < 0 or row >= len(self.upcoming):
@@ -985,6 +1144,20 @@ class Window(QMainWindow):
     def _on_xfade_slider(self, v: int) -> None:
         self.xfade_label.setText(f"{v}s")
         self.player.set_crossfade(self.xfade_chk.isChecked(), v)
+
+    # Randomness knob → planner.randomness. Dial 0–100 maps directly to the
+    # [0, 1] knob: 0 = coherent (Gaussian pinned to the nearest), 1 = wild
+    # (broad Gaussian + frequent long jumps). Default sits at the value
+    # calibrated to match the prior softmax mixes.
+    def _on_randomness(self, v: int) -> None:
+        r = v / 100.0
+        self.planner.set_randomness(r)
+        self.rnd_label.setText(f"{r:.2f}")
+
+    def _on_model_changed(self, _index: int) -> None:
+        key = self.model_combo.currentData()
+        if key:
+            self.planner.set_model(key)
 
     def _on_artist_input_submit(self) -> None:
         name = self.artist_input.text().strip()
@@ -1075,7 +1248,7 @@ class Window(QMainWindow):
             stalled_for = time.monotonic() - self._track_started_at
             if stalled_for > PLAY_LOAD_TIMEOUT_S and self._last_poll_advanced_for != self.current.track_id:
                 logger.warning("track %s never loaded (stalled %.1fs) — skipping",
-                               self.current.path, stalled_for)
+                               self.current.rel_path, stalled_for)
                 self._last_poll_advanced_for = self.current.track_id
                 self._advance_forward()
                 return
@@ -1108,7 +1281,7 @@ class Window(QMainWindow):
             self.now_sub.setText("")
             return
         t = self.current
-        self.now_label.setText(f"▶  {t.artist or '?'} — {t.title or Path(t.path).stem}")
+        self.now_label.setText(f"▶  {t.artist or '?'} — {t.title or Path(t.rel_path).stem}")
         genre_bits = []
         if t.ai_genre:
             genre_bits.append(f"ai: {t.ai_genre}")
@@ -1126,14 +1299,14 @@ class Window(QMainWindow):
             dur_s = f"   {_fmt_time(t0.duration_s)}" if t0.duration_s else ""
             self.next_panel.set_track(
                 t0.track_id,
-                f"{t0.artist or '?'} — {t0.title or Path(t0.path).stem}{dur_s}",
+                f"{t0.artist or '?'} — {t0.title or Path(t0.rel_path).stem}{dur_s}",
             )
         else:
             self.next_panel.set_track(None, "")
         # Rest of queue (upcoming[1:]) in the list
         self.queue_list.clear()
         for i, t in enumerate(self.upcoming[1:], start=2):
-            line = f"{i:>2}. {t.artist or '?'} — {t.title or Path(t.path).stem}"
+            line = f"{i:>2}. {t.artist or '?'} — {t.title or Path(t.rel_path).stem}"
             item = QListWidgetItem()
             item.setData(Qt.UserRole, t.track_id)
             item.setSizeHint(QSize(0, 28))

@@ -1,11 +1,24 @@
-"""Qdrant-backed track index for AI DJ. Collection: tracks, vector: MERT (768-d cosine)."""
+"""Qdrant-backed track index for AI DJ. Collection: tracks, vector: MERT (768-d cosine).
+
+The vector DB is **local per user** — embedded Qdrant (file-backed), no
+server, no container. Storage lives at `config.db_root()` (the `db/`
+sub-folder of the bundle). Single-process holds the file lock at a time,
+which matches the app's lifecycle: the GUI opens the index at startup and
+keeps it for the session; indexing is folded into the same process.
+
+Server mode is still constructible (`TrackIndex(host=..., port=...)`) so the
+one-shot migration script can copy points out of the old server before it's
+retired."""
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
+
+from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +27,32 @@ DIM = 768
 
 
 class TrackIndex:
-    def __init__(self, host: str = "127.0.0.1", port: int = 6333):
-        self.client = QdrantClient(host=host, port=port)
+    def __init__(
+        self,
+        *,
+        path: "str | Path | None" = None,
+        host: str | None = None,
+        port: int = 6333,
+    ):
+        """Default: embedded at `config.db_root()`. Pass `host=...` for the
+        legacy server (migration only) or `path=...` for an explicit location."""
+        if host is not None:
+            self.client = QdrantClient(host=host, port=port)
+            self._mode = "server"
+        else:
+            store = Path(path) if path is not None else config.db_root()
+            store.mkdir(parents=True, exist_ok=True)
+            self.client = QdrantClient(path=str(store))
+            self._mode = "embedded"
+            self._path = store
+
+    def close(self) -> None:
+        """Release the embedded-mode file lock so another process (or a
+        rebuild) can open it. Server mode connections close on GC."""
+        try:
+            self.client.close()
+        except Exception:  # noqa: BLE001
+            pass
 
     def ensure_collection(self) -> None:
         if self.client.collection_exists(COLLECTION):
@@ -86,6 +123,20 @@ class TrackIndex:
             if tagger:
                 payload["ai_tagger"] = tagger
             self.client.set_payload(COLLECTION, payload=payload, points=[track_id], wait=False)
+
+    def set_recovered_meta(
+        self, updates: list[tuple[str, str, str, float]]
+    ) -> None:
+        """Write AcoustID-recovered metadata onto existing points. Each
+        update is (track_id, artist, title, score). `meta_source` is stamped
+        so the UI / a re-index can tell recovered tags from original ones."""
+        for track_id, artist, title, score in updates:
+            self.client.set_payload(
+                COLLECTION,
+                payload={"artist": artist, "title": title,
+                         "meta_source": "acoustid", "meta_score": float(score)},
+                points=[track_id], wait=False,
+            )
 
     def all_ids(self) -> list[str]:
         """Every track id in the collection, for tagger re-runs."""
