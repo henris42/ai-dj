@@ -12,14 +12,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import random
+
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QPushButton,
@@ -30,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import photos as photosmod
 from ..index import COLLECTION, TrackIndex
 
 
@@ -156,6 +162,112 @@ class _SongsView(QWidget):
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
 
+class _GroupGrid(QListWidget):
+    """Generic icon-mode grid: one cell per group (album or artist), text
+    label and an optional photo. Activating a cell emits `seed_requested`
+    with a random track id from that group — the planner takes it from
+    there."""
+
+    seed_requested = Signal(str)
+
+    def __init__(self, *, cell: QSize, icon: QSize) -> None:
+        super().__init__()
+        self.setViewMode(QListView.IconMode)
+        self.setResizeMode(QListView.Adjust)
+        self.setMovement(QListView.Static)
+        self.setSpacing(8)
+        self.setIconSize(icon)
+        self.setGridSize(cell)
+        self.setUniformItemSizes(True)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.itemActivated.connect(self._on_activate)
+
+    def _on_activate(self, item: QListWidgetItem) -> None:
+        ids = item.data(Qt.UserRole)
+        if ids:
+            self.seed_requested.emit(random.choice(ids))
+
+
+def _by_group(rows, group_key) -> "dict[tuple, list]":
+    """Group song rows by (key tuple) → list of (track_id, ...)."""
+    groups: dict[tuple, list] = {}
+    for r in rows:
+        k = group_key(r)
+        if not k or k[0] in (None, ""):
+            continue
+        groups.setdefault(k, []).append(r)
+    return groups
+
+
+def _placeholder_pixmap(size: QSize, glyph: str, hex_color: str) -> QPixmap:
+    """Solid color tile with a letter — used when no photo exists yet."""
+    px = QPixmap(size)
+    from PySide6.QtGui import QColor, QPainter, QFont
+    px.fill(QColor(hex_color))
+    p = QPainter(px)
+    p.setPen(QColor("white"))
+    f = QFont()
+    f.setPointSize(int(size.height() * 0.45))
+    f.setBold(True)
+    p.setFont(f)
+    p.drawText(px.rect(), Qt.AlignCenter, glyph[:1].upper())
+    p.end()
+    return px
+
+
+class _AlbumsView(_GroupGrid):
+    """Grid of albums (artist + album), one tile per album. Click activates
+    a random track from that album as the planner's seed."""
+
+    CELL = QSize(180, 180)
+    ICON = QSize(150, 110)
+
+    def __init__(self, all_rows: list) -> None:
+        super().__init__(cell=self.CELL, icon=self.ICON)
+        # rows are (tid, artist, album, title, dur, genre)
+        groups = _by_group(all_rows, lambda r: (r[2], r[1]))   # (album, artist)
+        # Stable order: by artist then album.
+        order = sorted(groups.keys(), key=lambda k: (k[1].lower(), k[0].lower()))
+        for album, artist in order:
+            ids = [r[0] for r in groups[(album, artist)]]
+            item = QListWidgetItem(f"{album}\n{artist}")
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setData(Qt.UserRole, ids)
+            item.setIcon(QIcon(_placeholder_pixmap(self.ICON, album, "#2c3340")))
+            self.addItem(item)
+
+
+class _ArtistsView(_GroupGrid):
+    """Grid of artists, using the auto-fetched photo when present
+    (<bundle>/Photos/<Artist>/artist_01.jpg). Click activates a random
+    track from that artist."""
+
+    CELL = QSize(190, 220)
+    ICON = QSize(160, 160)
+
+    def __init__(self, all_rows: list) -> None:
+        super().__init__(cell=self.CELL, icon=self.ICON)
+        groups = _by_group(all_rows, lambda r: (r[1],))        # (artist,)
+        order = sorted(groups.keys(), key=lambda k: k[0].lower())
+        root = photosmod.photo_root()
+        for (artist,) in order:
+            ids = [r[0] for r in groups[(artist,)]]
+            item = QListWidgetItem(f"{artist}\n{len(ids)} tracks")
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setData(Qt.UserRole, ids)
+            item.setIcon(self._artist_icon(root, artist))
+            self.addItem(item)
+
+    def _artist_icon(self, root, artist: str) -> QIcon:
+        safe = photosmod.safe(artist)
+        candidate = root / safe / "artist_01.jpg"
+        if candidate.exists():
+            pm = QPixmap(str(candidate)).scaled(
+                self.ICON, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            return QIcon(pm)
+        return QIcon(_placeholder_pixmap(self.ICON, artist, "#4a3340"))
+
+
 class LibraryWindow(QMainWindow):
     """Non-modal Library viewer — opens from the main window's transport.
 
@@ -195,17 +307,15 @@ class LibraryWindow(QMainWindow):
         self.songs.seed_requested.connect(self.seed_requested)
         self.stack.addWidget(self.songs)
 
-        albums_placeholder = QLabel("Albums grid — coming in the next pass")
-        albums_placeholder.setAlignment(Qt.AlignCenter)
-        albums_placeholder.setStyleSheet("color: #666; padding: 80px;")
-        self.stack.addWidget(albums_placeholder)
+        # Albums + Artists share the Songs view's loaded rows — no second
+        # scroll over Qdrant.
+        self.albums = _AlbumsView(self.songs._all_rows)
+        self.albums.seed_requested.connect(self.seed_requested)
+        self.stack.addWidget(self.albums)
 
-        artists_placeholder = QLabel("Artists grid — coming in the next pass\n"
-                                     "(will use the photos auto-fetched into "
-                                     "<bundle>/Photos/<Artist>/)")
-        artists_placeholder.setAlignment(Qt.AlignCenter)
-        artists_placeholder.setStyleSheet("color: #666; padding: 80px;")
-        self.stack.addWidget(artists_placeholder)
+        self.artists = _ArtistsView(self.songs._all_rows)
+        self.artists.seed_requested.connect(self.seed_requested)
+        self.stack.addWidget(self.artists)
 
         self._show("Songs")
 

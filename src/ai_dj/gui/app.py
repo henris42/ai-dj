@@ -385,6 +385,7 @@ class Window(QMainWindow):
         super().__init__()
         self.setWindowTitle("AI DJ")
         self.resize(1280, 820)
+        self.setAcceptDrops(True)             # drop a file → seed the planner
 
         self.idx = idx
         self.proj = proj
@@ -1175,6 +1176,57 @@ class Window(QMainWindow):
         self._library_window.show()
         self._library_window.raise_()
         self._library_window.activateWindow()
+
+    # ---- drag-drop seed ----
+    def dragEnterEvent(self, ev):  # noqa: N802
+        if ev.mimeData().hasUrls() and any(u.isLocalFile() for u in ev.mimeData().urls()):
+            ev.acceptProposedAction()
+        else:
+            super().dragEnterEvent(ev)
+
+    def dropEvent(self, ev):  # noqa: N802
+        """Drop a music file (or a folder containing one) onto the window
+        → seed the planner from it. If the file isn't yet indexed under any
+        configured library source, the drop is logged for the future
+        in-app indexer to pick up (Phase 2.5)."""
+        if not ev.mimeData().hasUrls():
+            super().dropEvent(ev)
+            return
+        from ai_dj import config as configmod
+        from ai_dj import settings as settings_mod
+        from ai_dj.scan import AUDIO_EXTS, rel_track_id
+
+        sources = settings_mod.load().library_sources
+        roots = ([Path(s.path).resolve() for s in sources]
+                 if sources else [configmod.music_root().resolve()])
+
+        for url in ev.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            p = Path(url.toLocalFile())
+            if p.is_dir():
+                cand = next((f for f in p.rglob("*")
+                             if f.is_file() and f.suffix.lower() in AUDIO_EXTS),
+                            None)
+                if cand is None:
+                    continue
+                p = cand
+            if p.suffix.lower() not in AUDIO_EXTS:
+                continue
+            for root in roots:
+                try:
+                    rel = p.resolve().relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                tid = rel_track_id(rel)
+                rec = self.idx.client.retrieve(
+                    COLLECTION, [tid], with_payload=False, with_vectors=False)
+                if rec:
+                    self.start_mix_from(tid)
+                    ev.acceptProposedAction()
+                    return
+            logger.info("dropped track not indexed yet: %s", p)
+        ev.acceptProposedAction()
 
     def start_mix_from(self, track_id: str) -> None:
         """Seed the planner from a specific track id (e.g. picked in the
